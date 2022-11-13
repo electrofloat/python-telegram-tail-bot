@@ -17,13 +17,10 @@ import sys
 import logging
 from config import Config
 from incident import Incident
-from datetime import datetime
-import time
+import command
+from stats import Stats
 import subprocess
-import select
-import os
-import re
-import shlex
+import re, threading, queue
 
 try:
     import argparse
@@ -35,186 +32,138 @@ try:
     from telegram import Update
     from telegram import ParseMode
     from telegram.ext import Updater
-    from telegram.ext import CallbackContext
     from telegram.ext import CommandHandler
+    from telegram.bot import BotCommand
 except ImportError:
     print("ERROR: install ptb manually: sudo pip install python-telegram-bot --upgrade")
     sys.exit(2)
 
-global stats, cfg
-stats = { 'starttime': 0, 'loglines_read': 0, 'incidents_created': 0, 'incidents_silenced': 0, 'incidents_sent': 0 }
+class Pttb():
+    def __init__(self, args):
+        self.debug = args.debug
+        self.verbose = args.verbose
+        self.config = args.config
+        self.file = args.file
+        self.queue = queue.Queue()
+        self.commands = []
 
-def setup_logger(debug=False):
-    if debug:
-        level = logging.DEBUG
-    else:
-        level = logging.INFO
-    logging.basicConfig(format='[%(levelname)-8s] %(name)s - %(funcName)s: %(message)s', level=level)
+        self.logger = self._setup_logger()
+        self._setup_config()
 
+    def _setup_config(self):
+        Config.config = self.config
+        if not Config.read():
+            logging.error("Aborting")
+            sys.exit(3)
 
-def bot_cmd_start(update: Update, context: CallbackContext):
-    context.bot.send_message(chat_id=update.effective_chat.id, text="I'm a bot, please talk to me!")
+    def add_command(self, command):
+        self.commands.append(command())
 
-
-def bot_cmd_stats(update: Update, context: CallbackContext):
-    global stats
-
-    time_str = datetime.utcfromtimestamp(stats['starttime']).strftime('%Y-%m-%d %H:%M:%S UTC')
-    mystats = stats.copy()
-    mystats['starttime'] = time_str
-
-    msg = "<pre>%s</pre>" % mystats
-    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode=ParseMode.HTML)
-
-def bot_cmd_trigger(update: Update, context: CallbackContext):
-    global cfg
-
-    argv = shlex.split(update.message.text)[1:]
-    logging.info("text: %s" % argv)
-    msg = ""
-    if len(argv) == 0:
-        triggers = cfg.trigger_list()
-        msg += "%d trigger(s) follow:\n" % len(triggers)
-        msg += "<pre>\n"
-        idx = 0
-        for t in triggers:
-            msg += "idx %d: \n" % idx
-            msg += "  * regexp='%(regexp)s'\n  * duration=%(duration)d\n  * message='%(message)s'\n" % t
-            idx += 1
-        msg += "</pre>\n"
-    elif argv[0].lower() == "add":
-        subcmd = argv.pop(0)
-        duration = 10
-        message = "(unset)"
-        err = None
-        if len(argv) < 1 or len(argv) > 3:
-            err = "Expecting 1-3 arguments\n"
-        if len(argv) > 0:
-            regexp = argv.pop(0)
-        if len(argv) > 0:
-            if not argv[0].isnumeric():
-                err = "Expecting second argument as a number\n"
-            else:
-                duration = int(argv.pop(0))
-        if len(argv) > 0:
-            message = argv.pop(0)
-        if err:
-            msg += "Error: %s" % err
+    def _setup_logger(self):
+        if self.debug:
+            level = logging.DEBUG
+        elif self.verbose:
+            level = logging.INFO
         else:
-            ret, retmsg = cfg.trigger_add(regexp, duration, message)
-            if not ret:
-                msg = "Error: %s\n" % retmsg
-            else:
-                cfg.write()
-                msg = "Success: %s\n" % retmsg
+            level = logging.CRITICAL + 1
 
-    elif argv[0].lower() == "del":
-        if len(argv) != 2:
-            msg += "Error: Expecting excatly 1 argument\n"
-        elif not argv[1].isnumeric():
-            msg += "Error: Expecting first argument as a number\n"
-        else:
-            idx = int(argv[1])
-            ret, retmsg = cfg.trigger_del(idx)
-            if not ret:
-                msg += "Error: %s\n" % retmsg
-            else:
-                msg += "Success: %s\n" % retmsg
-    else:
-        msg += "Usage: \n"
-        msg += "<code>/trigger</code> - List triggers\n"
-        msg += "<code>/trigger add '&lt;regex&gt;' &lt;duration&gt; '&lt;message&gt;'</code> - Add a new trigger with a quoted regular expression with a coalesce duration in seconds (may be 0), and a quoted message\n"
-        msg += "<code>/trigger del &lt;idx&gt;</code> - Remove a trigger by its listed index\n"
+        logging.basicConfig(format='[%(levelname)-8s] %(name)s - %(funcName)s: %(message)s', level=level)
 
-    context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode=ParseMode.HTML)
+    def _setup_bot(self):
+        bot_commands = []
+        for cmd in self.commands:
+            bot_commands.append(BotCommand(str(cmd), cmd.get_short_description()))
 
-def setup_bot(logger):
-    global cfg
+        self.bot_queue = Updater(token=Config.token_get())
 
-    bot = Updater(token=cfg.token_get())
-    bot.dispatcher.add_handler(CommandHandler('start', bot_cmd_start))
-    bot.dispatcher.add_handler(CommandHandler('stats', bot_cmd_stats))
-    bot.dispatcher.add_handler(CommandHandler('trigger', bot_cmd_trigger))
-    bot.start_polling()
-    bot.dispatcher.bot.send_message(chat_id=cfg.chatid_get(), text="Hello, I'm ready to gobble up some logs")
-    return bot
+        self.bot_queue.dispatcher.bot.set_my_commands(bot_commands)
+        for cmd in self.commands:
+            self.bot_queue.dispatcher.add_handler(CommandHandler(str(cmd), cmd.handler))
 
+        self.bot_queue.start_polling()
+        #self.bot_queue.dispatcher.bot.send_message(chat_id=cfg.chatid_get(), text="Hello, I'm ready to gobble up some logs")
 
-def main_tail(logger, args, bot):
-    global stats, cfg
+    def __enqueue_output(self, out, queue):
+        for line in iter(out.readline, b''):
+            self.queue.put(line.rstrip())
+        out.close()
 
-    if not os.path.exists(args.file):
-        logging.warning("file %s currently does not exist" % args.file)
+    def _main_tail(self):
+        cmd = ['tail', '-F', '-q', '-n', '0'] + self.file
+        f = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize = 1, close_fds = True, universal_newlines = True)
+        thread = threading.Thread(target=self.__enqueue_output, args=(f.stdout, self.queue))
+        thread.daemon = True
+        thread.start()
 
-    f = subprocess.Popen(['tail', '-F', '-n', '0', args.file], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    p = select.poll()
-    p.register(f.stdout)
+        incidents = {}
+        Stats.start()
+        timeout = None
+        while True:
+            try:
+                line = self.queue.get(block = True, timeout = timeout)
+                Stats.loglines_read()
+                logging.debug("line: %s" % line)
 
-    incidents = {}
-    stats['starttime'] = time.time()
-    while True:
-        if p.poll(1.0):
-            line = f.stdout.readline().decode('utf-8').strip()
-            stats['loglines_read'] += 1
-            logging.debug("line: %s" % line)
+                for t in Config.trigger_list():
+                    if re.search(t['regexp'], line):
+                        logging.debug("trigger '%s' matched line '%s'" % (t['regexp'], line))
+                        if not t['regexp'] in incidents:
+                            i = Incident(t['regexp'], Config.get_duration_in_sec(t['duration']), t['message'])
+                            logging.info("incident #%d created for trigger '%s'" % (i.getid(), t['regexp']))
+                            incidents[t['regexp']] = i
+                            Stats.incidents_created()
+                        incidents[t['regexp']].feedlog(line)
 
-            for t in cfg.trigger_list():
-                if re.search(t['regexp'], line):
-                    logging.debug("trigger '%s' matched line '%s'" % (t['regexp'], line))
-                    if not t['regexp'] in incidents:
-                        i = Incident(t['regexp'], t['duration'], t['message'])
-                        logging.info("incident #%d created for trigger '%s'" % (i.getid(), t['regexp']))
-                        incidents[t['regexp']] = i
-                        stats['incidents_created'] += 1
-                    incidents[t['regexp']].feedlog(line)
-        else:
-            time.sleep(0.25)
+            except queue.Empty:
+                pass
+            finally:
+                timeout = None
+                for k in list(incidents):
+                    if not timeout:
+                        timeout = incidents[k].duration
+                    timeout = min(timeout, incidents[k].time_left())
+                    if incidents[k].expired():
+                        i = incidents[k].getid()
+                        msg = incidents[k].render()
+                        logging.debug("incident #%d expired, message '%s'" % (i, repr(msg)))
 
-        for k in list(incidents):
-            if incidents[k].expired():
-                i = incidents[k].getid()
-                msg = incidents[k].render()
-                logging.debug("incident #%d expired, message '%s'" % (i, repr(msg)))
+                        silence = False
+                        for s in Config.silence_list():
+                            if re.search(s['regexp'], msg):
+                                logging.debug("silence '%s' matched message for incident #%d" % (s['regexp'], i))
+                                silence = True
+                        if silence:
+                            logging.warning("silencing notification for incident #%d" % i)
+                            Stats.incidents_silenced()
+                        else:
+                            logging.info("sending notification for incident #%d" % i)
+                            self.bot_queue.dispatcher.bot.send_message(chat_id=Config.chatid_get(), text=msg, parse_mode=ParseMode.HTML)
+                            Stats.incidents_sent()
 
-                silence = False
-                for s in cfg.silence_list():
-                    if re.search(s['regexp'], msg):
-                        logging.debug("silence '%s' matched message for incident #%d" % (s['regexp'], i))
-                        silence = True
-                if silence:
-                    logging.warning("silencing notification for incident #%d" % i)
-                    stats['incidents_silenced'] += 1
-                else:
-                    logging.info("sending notification for incident #%d" % i)
-                    bot.dispatcher.bot.send_message(chat_id=cfg.chatid_get(), text=msg, parse_mode=ParseMode.HTML)
-                    stats['incidents_sent'] += 1
+                        del incidents[k]
+                logging.debug("Timeout: {}".format(timeout))
+        return
 
-                del incidents[k]
-    return
+    def run(self):
+        self._setup_bot()
+        self._main_tail()
 
 def main():
-    global cfg
-
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('-v', dest='verbose', action='store_true', help="""Enable verbosity, default False""")
     parser.add_argument('-d', dest='debug', action='store_true', help="""Enable debug, default False""")
     parser.add_argument('-c', '--config', dest='config', default="/etc/pttb/pttb.yaml", type=str, 
             help="""Location of the YAML config file, default /etc/pttb/pttb.yaml""")
-    parser.add_argument('--file', "-f", dest='file', required=True, type=str, help="""Logfile to perform tail on""")
+    parser.add_argument('--file', "-f", dest='file', nargs='+', required=True, type=str, help="""Logfile(s) to perform tail on""")
 
     args = parser.parse_args()
-    logger = setup_logger(debug=args.debug)
-    if args.debug:
-        logging.debug("Arguments: %s" % args)
 
-    cfg = Config(config=args.config)
-    if not cfg.read():
-        logging.error("Aborting")
-        sys.exit(3)
+    pttb = Pttb(args)
+    pttb.add_command(command.CommandTrigger)
+    pttb.add_command(command.CommandStats)
+    pttb.add_command(command.CommandSilence)
 
-    bot = setup_bot(logger)
-
-    main_tail(logger, args, bot)
+    pttb.run()
 
     logging.info("Exiting successfully. A job well done!")
     sys.exit(0)

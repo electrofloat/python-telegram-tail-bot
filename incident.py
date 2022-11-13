@@ -36,7 +36,7 @@ class Incident():
         self.message = message
         self.duration = duration
         self.loglines = []
-        self.created = time.time()
+        self.created = time.monotonic()
         self.expiry = self.created + self.duration
 
     def getid(self):
@@ -46,8 +46,15 @@ class Incident():
         self.loglines.append(logline)
         pass
 
+    def time_left(self):
+        now = time.monotonic()
+        if now < self.expiry:
+            return self.expiry - now
+
+        return 0
+
     def expired(self):
-        expired = time.time() > self.expiry
+        expired = time.monotonic() > self.expiry
         if expired:
             logger.debug("incident has expired")
             return True
